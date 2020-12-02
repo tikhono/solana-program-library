@@ -4,6 +4,7 @@ use crate::error::EscrowError;
 use crate::instruction::EscrowInstruction;
 use crate::state::*;
 use num_traits::FromPrimitive;
+use solana_program::clock::UnixTimestamp;
 use solana_program::program::invoke_signed;
 use solana_program::{
     account_info::{next_account_info, AccountInfo},
@@ -193,6 +194,8 @@ impl Processor {
             launcher: *launcher_info.key,
             canceler: *canceler_info.key,
             canceler_token_account: *canceler_token_account_info.key,
+            total_amount: 100,
+            total_recipients: 1,
             ..Default::default()
         });
 
@@ -563,6 +566,818 @@ impl PrintProgramError for EscrowError {
             EscrowError::NotEnoughBalance => info!("Error: not enough balance"),
             EscrowError::OracleNotInitialized => info!("Error: oracle not initialized"),
             EscrowError::TooManyPayouts => info!("Error: too many payouts"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::instruction::*;
+    use solana_program::{
+        instruction::Instruction, program_pack::Pack, program_stubs, rent::Rent, sysvar,
+    };
+    use solana_sdk::account::{create_account, create_is_signer_account_infos, Account};
+    use spl_token::{
+        instruction::{initialize_account, initialize_mint},
+        processor::Processor as TokenProcessor,
+        state::{Account as SplAccount, Mint as SplMint},
+    };
+
+    /// Test program id for the token program.
+    const TOKEN_PROGRAM_ID: Pubkey = Pubkey::new_from_array([1u8; 32]);
+
+    /// Test program id for the token program.
+    const ESCROW_PROGRAM_ID: Pubkey = Pubkey::new_from_array([2u8; 32]);
+
+    /// Actual stake account program id, used for tests
+    fn escrow_program_id() -> Pubkey {
+        "rK6j1hcHDTWerdrAS2w3BFifjHkPrRrnGYC7GRNwqKF"
+            .parse::<Pubkey>()
+            .unwrap()
+    }
+    struct TestSyscallStubs {}
+    impl program_stubs::SyscallStubs for TestSyscallStubs {
+        fn sol_invoke_signed(
+            &self,
+            instruction: &Instruction,
+            account_infos: &[AccountInfo],
+            signers_seeds: &[&[&[u8]]],
+        ) -> ProgramResult {
+            info!("TestSyscallStubs::sol_invoke_signed()");
+
+            let mut new_account_infos = vec![];
+            for meta in instruction.accounts.iter() {
+                for account_info in account_infos.iter() {
+                    if meta.pubkey == *account_info.key {
+                        let mut new_account_info = account_info.clone();
+                        for seeds in signers_seeds.iter() {
+                            let signer =
+                                Pubkey::create_program_address(seeds, &ESCROW_PROGRAM_ID).unwrap();
+                            if *account_info.key == signer {
+                                new_account_info.is_signer = true;
+                            }
+                        }
+                        new_account_infos.push(new_account_info);
+                    }
+                }
+            }
+
+            match instruction.program_id {
+                TOKEN_PROGRAM_ID => invoke_token(&new_account_infos, &instruction.data),
+                pubkey => {
+                    if pubkey == escrow_program_id() {
+                        invoke_stake(&new_account_infos, &instruction.data)
+                    } else {
+                        Err(ProgramError::IncorrectProgramId)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Mocks token instruction invocation
+    pub fn invoke_token<'a>(account_infos: &[AccountInfo<'a>], input: &[u8]) -> ProgramResult {
+        spl_token::processor::Processor::process(&TOKEN_PROGRAM_ID, &account_infos, &input)
+    }
+
+    /// Mocks stake account instruction invocation
+    pub fn invoke_stake<'a>(_account_infos: &[AccountInfo<'a>], _input: &[u8]) -> ProgramResult {
+        // For now always return ok
+        Ok(())
+    }
+    fn test_syscall_stubs() {
+        use std::sync::Once;
+        static ONCE: Once = Once::new();
+
+        ONCE.call_once(|| {
+            program_stubs::set_syscall_stubs(Box::new(TestSyscallStubs {}));
+        });
+    }
+
+    fn account_minimum_balance() -> u64 {
+        Rent::default().minimum_balance(SplAccount::get_packed_len())
+    }
+
+    fn mint_minimum_balance() -> u64 {
+        Rent::default().minimum_balance(SplMint::get_packed_len())
+    }
+
+    struct TokenInfo {
+        key: Pubkey,
+        account: Account,
+        owner: Pubkey,
+    }
+
+    fn create_token_account(
+        program_id: &Pubkey,
+        mint_key: &Pubkey,
+        mint_account: &mut Account,
+        owner: &Pubkey,
+        owner_account: &mut Account,
+        lamports: u64,
+    ) -> TokenInfo {
+        let mut token = TokenInfo {
+            key: Pubkey::new_unique(),
+            account: Account::new(
+                account_minimum_balance() + lamports,
+                SplAccount::get_packed_len(),
+                &program_id,
+            ),
+            owner: *owner,
+        };
+        let mut rent_sysvar_account = create_account(&Rent::free(), 1);
+
+        // create account
+        do_process_instruction(
+            initialize_account(&program_id, &token.key, &mint_key, &token.owner).unwrap(),
+            vec![
+                &mut token.account,
+                mint_account,
+                owner_account,
+                &mut rent_sysvar_account,
+            ],
+        )
+        .unwrap();
+
+        token
+    }
+
+    fn create_mint(
+        program_id: &Pubkey,
+        authority_key: &Pubkey,
+        lamports: u64,
+    ) -> (Pubkey, Account) {
+        let mint_key = Pubkey::new_unique();
+        let mut mint_account = Account::new(
+            mint_minimum_balance() + lamports,
+            SplMint::get_packed_len(),
+            &program_id,
+        );
+        let mut rent_sysvar_account = create_account(&Rent::free(), 1);
+
+        // create token mint
+        do_process_instruction(
+            initialize_mint(&program_id, &mint_key, authority_key, None, 2).unwrap(),
+            vec![&mut mint_account, &mut rent_sysvar_account],
+        )
+        .unwrap();
+
+        (mint_key, mint_account)
+    }
+
+    fn do_process_instruction(
+        instruction: Instruction,
+        accounts: Vec<&mut Account>,
+    ) -> ProgramResult {
+        test_syscall_stubs();
+
+        // approximate the logic in the actual runtime which runs the instruction
+        // and only updates accounts if the instruction is successful
+        let mut account_clones = accounts.iter().map(|x| (*x).clone()).collect::<Vec<_>>();
+        let mut meta = instruction
+            .accounts
+            .iter()
+            .zip(account_clones.iter_mut())
+            .map(|(account_meta, account)| (&account_meta.pubkey, account_meta.is_signer, account))
+            .collect::<Vec<_>>();
+        let mut account_infos = create_is_signer_account_infos(&mut meta);
+        let res = if instruction.program_id == ESCROW_PROGRAM_ID {
+            Processor::process(&instruction.program_id, &account_infos, &instruction.data)
+        } else {
+            TokenProcessor::process(&instruction.program_id, &account_infos, &instruction.data)
+        };
+
+        if res.is_ok() {
+            let mut account_metas = instruction
+                .accounts
+                .iter()
+                .zip(accounts)
+                .map(|(account_meta, account)| (&account_meta.pubkey, account))
+                .collect::<Vec<_>>();
+            for account_info in account_infos.iter_mut() {
+                for account_meta in account_metas.iter_mut() {
+                    if account_info.key == account_meta.0 {
+                        let account = &mut account_meta.1;
+                        account.owner = *account_info.owner;
+                        account.lamports = **account_info.lamports.borrow();
+                        account.data = account_info.data.borrow().to_vec();
+                    }
+                }
+            }
+        }
+        res
+    }
+
+    /// Escrow data
+    #[repr(C)]
+    #[derive(Clone, Debug, PartialEq)]
+    pub struct EscrowInfo {
+        ///Escrow pubkey
+        pub escrow_key: Pubkey,
+        ///Account
+        pub escrow_account: Account,
+        /// Current state of escrow entity: Uninitialized, Launched, Pending, Partial, Paid, Complete, Cancelled
+        pub state: EscrowState,
+        /// Escrow expiration timestamp
+        pub expires: UnixTimestamp,
+        /// Program authority
+        pub authority: Pubkey,
+        /// Program authority account
+        pub authority_account: Account,
+        /// Program authority bump seed
+        pub bump_seed: u8,
+        /// Mint for the token handled by the escrow
+        pub token_mint: Pubkey,
+        /// Account to hold tokens for sendout, its owner should be escrow contract authority
+        pub token_account: Pubkey,
+        /// Account to hold tokens for sendout, its owner should be escrow contract authority
+        pub token_account_account: Account,
+        /// Pubkey of the reputation oracle
+        pub reputation_oracle: COption<Pubkey>,
+        /// Account for the reputation oracle to receive fee
+        pub reputation_oracle_token_account: COption<Pubkey>,
+        /// Account for the reputation oracle to receive fee
+        pub reputation_oracle_token_account_account: Account,
+        /// Reputation oracle fee (in percents)
+        pub reputation_oracle_stake: u8,
+        /// Pubkey of the recording oracle
+        pub recording_oracle: COption<Pubkey>,
+        /// Account for the recording oracle to receive fee
+        pub recording_oracle_token_account: COption<Pubkey>,
+        /// Account for the recording oracle to receive fee
+        pub recording_oracle_token_account_account: Account,
+        /// Recording oracle fee (in percents)
+        pub recording_oracle_stake: u8,
+        /// Launcher pubkey
+        pub launcher: Pubkey,
+        /// Launcher Account
+        pub launcher_account: Account,
+        /// Canceler pubkey
+        pub canceler: Pubkey,
+        /// Account for the canceler to receive back tokens
+        pub canceler_token_account: Pubkey,
+        /// Account for the canceler to receive back tokens
+        pub canceler_token_account_account: Account,
+        /// Total amount of tokens to pay out
+        pub total_amount: u64,
+        /// Total number of recipients
+        pub total_recipients: u64,
+        /// Amount in tokens already sent
+        pub sent_amount: u64,
+        /// Number of recipients already sent to
+        pub sent_recipients: u64,
+        /// Job manifest url
+        pub manifest_url: DataUrl,
+        /// Job manifest hash
+        pub manifest_hash: DataHash,
+        /// Job results url
+        pub final_results_url: DataUrl,
+        /// Job results hash
+        pub final_results_hash: DataHash,
+        /// Recipient key
+        pub recipient: Pubkey,
+        /// Recipient account
+        pub recipient_account: Account,
+    }
+
+    fn initialize_escrow() -> EscrowInfo {
+        let escrow = Pubkey::new_unique();
+        let mut escrow_account = Account::new(1000, Escrow::LEN, &ESCROW_PROGRAM_ID);
+
+        let mut clock = Account::new(0, 100, &sysvar::clock::id());
+
+        let (authority, bump_seed) =
+            Processor::find_authority_bump_seed(&ESCROW_PROGRAM_ID, &escrow);
+
+        let mut authority_account = Account::new(0, 0, &authority);
+
+        let (token_mint, mut token_mint_account) = create_mint(&TOKEN_PROGRAM_ID, &authority, 1000);
+
+        let mut token = create_token_account(
+            &TOKEN_PROGRAM_ID,
+            &token_mint,
+            &mut token_mint_account,
+            &authority,
+            &mut authority_account,
+            1000,
+        );
+
+        let launcher = Pubkey::new_unique();
+        let mut launcher_account = Account::new(0, 0, &launcher);
+
+        let canceler = Pubkey::new_unique();
+        let mut canceler_account = Account::default();
+
+        let mut canceler_token = create_token_account(
+            &TOKEN_PROGRAM_ID,
+            &token_mint,
+            &mut token_mint_account,
+            &authority,
+            &mut authority_account,
+            1000,
+        );
+
+        let _result = do_process_instruction(
+            initialize(
+                &ESCROW_PROGRAM_ID,
+                &escrow,
+                &token_mint,
+                &token.key,
+                &launcher,
+                &canceler,
+                &canceler_token.key,
+                1606402240,
+            )
+            .unwrap(),
+            vec![
+                &mut escrow_account,
+                &mut clock, //sysvar
+                &mut token_mint_account,
+                &mut token.account,
+                &mut launcher_account,
+                &mut canceler_account,
+                &mut canceler_token.account,
+            ],
+        )
+        .expect("Error on escrow initialize");
+        EscrowInfo {
+            escrow_key: escrow,
+            escrow_account,
+            expires: 1606402240,
+            authority,
+            authority_account,
+            bump_seed,
+            state: EscrowState::Launched,
+            token_mint,
+            token_account: token.key,
+            token_account_account: token.account,
+            reputation_oracle: COption::Some(Pubkey::new_from_array([3; 32])),
+            reputation_oracle_token_account: COption::Some(Pubkey::new_from_array([4; 32])),
+            reputation_oracle_token_account_account: Account::default(),
+            reputation_oracle_stake: 5,
+            recording_oracle: COption::None,
+            recording_oracle_token_account: COption::Some(Pubkey::new_from_array([6; 32])),
+            recording_oracle_token_account_account: Account::default(),
+            recording_oracle_stake: 10,
+            launcher,
+            launcher_account,
+            canceler,
+            canceler_token_account: canceler_token.key,
+            canceler_token_account_account: canceler_token.account,
+            total_amount: 20000000,
+            total_recipients: 1000000,
+            sent_amount: 2000000,
+            sent_recipients: 100000,
+            manifest_url: DataUrl::default(),
+            manifest_hash: DataHash::default(),
+            final_results_url: DataUrl::default(),
+            final_results_hash: DataHash::default(),
+            recipient: Default::default(),
+            recipient_account: Default::default(),
+        }
+    }
+
+    fn initialize_and_setup_escrow() -> EscrowInfo {
+        let escrow = Pubkey::new_unique();
+        let mut escrow_account = Account::new(1000, Escrow::LEN, &ESCROW_PROGRAM_ID);
+
+        let mut clock = Account::new(0, 100, &sysvar::clock::id());
+
+        let (authority, bump_seed) =
+            Pubkey::find_program_address(&[&escrow.to_bytes()[..32]], &ESCROW_PROGRAM_ID);
+        let mut authority_account = Account::new(1000, 0, &authority);
+
+        let (token_mint, mut token_mint_account) = create_mint(&TOKEN_PROGRAM_ID, &authority, 1000);
+        let mut token = create_token_account(
+            &TOKEN_PROGRAM_ID,
+            &token_mint,
+            &mut token_mint_account,
+            &authority,
+            &mut authority_account,
+            1000,
+        );
+
+        let launcher = Pubkey::new_unique();
+        let mut launcher_account = Account::new(1000, 0, &launcher);
+
+        let canceler = Pubkey::new_unique();
+
+        let mut canceler_token = create_token_account(
+            &TOKEN_PROGRAM_ID,
+            &token_mint,
+            &mut token_mint_account,
+            &authority,
+            &mut authority_account,
+            1000,
+        );
+
+        let _result = do_process_instruction(
+            spl_token::instruction::mint_to(
+                &TOKEN_PROGRAM_ID,
+                &token_mint,
+                &token.key,
+                &authority,
+                &[],
+                100,
+            )
+            .unwrap(),
+            vec![
+                &mut token_mint_account,
+                &mut token.account, //sysvar
+                &mut authority_account,
+            ],
+        )
+        .expect("Error on token minting");
+
+        let _result = do_process_instruction(
+            initialize(
+                &ESCROW_PROGRAM_ID,
+                &escrow,
+                &token_mint,
+                &token.key,
+                &launcher,
+                &canceler,
+                &canceler_token.key,
+                1606402240,
+            )
+            .unwrap(),
+            vec![
+                &mut escrow_account,
+                &mut clock, //sysvar
+                &mut token_mint_account,
+                &mut token.account,
+                &mut Account::default(),
+                &mut Account::default(),
+                &mut canceler_token.account,
+            ],
+        )
+        .expect("Error on escrow initialize");
+
+        let recipient = Pubkey::new_unique();
+        let recipient_token_account = create_token_account(
+            &TOKEN_PROGRAM_ID,
+            &token_mint,
+            &mut token_mint_account,
+            &authority,
+            &mut authority_account,
+            1000,
+        );
+
+        let reputation_oracle = Pubkey::new_unique();
+        let mut reputation_oracle_account = Account::new(1000, 0, &reputation_oracle);
+
+        let mut reputation_oracle_token_account = create_token_account(
+            &TOKEN_PROGRAM_ID,
+            &token_mint,
+            &mut token_mint_account,
+            &authority,
+            &mut authority_account,
+            1000,
+        );
+
+        let recording_oracle = Pubkey::new_unique();
+        let mut recording_oracle_account = Account::new(1000, 0, &recording_oracle);
+
+        let mut recording_oracle_token_account = create_token_account(
+            &TOKEN_PROGRAM_ID,
+            &token_mint,
+            &mut token_mint_account,
+            &authority,
+            &mut authority_account,
+            1000,
+        );
+
+        let reputation_oracle_stake = 30;
+        let recording_oracle_stake = 40;
+
+        let _result = do_process_instruction(
+            setup(
+                &ESCROW_PROGRAM_ID,
+                &escrow,
+                &launcher,
+                &reputation_oracle,
+                &reputation_oracle_token_account.key,
+                reputation_oracle_stake,
+                &recording_oracle,
+                &recording_oracle_token_account.key,
+                recording_oracle_stake,
+                &DataUrl::default(),
+                &DataHash::default(),
+            )
+            .unwrap(),
+            vec![
+                &mut escrow_account,
+                &mut launcher_account,
+                &mut clock, //sysvar
+                &mut reputation_oracle_account,
+                &mut reputation_oracle_token_account.account,
+                &mut recording_oracle_account,
+                &mut recording_oracle_token_account.account,
+            ],
+        )
+        .expect("Error on escrow setup");
+
+        EscrowInfo {
+            escrow_key: escrow,
+            escrow_account,
+            expires: 1606402240,
+            authority,
+            authority_account,
+            bump_seed,
+            state: EscrowState::Launched,
+            token_mint,
+            token_account: token.key,
+            token_account_account: token.account,
+            reputation_oracle: COption::Some(reputation_oracle),
+            reputation_oracle_token_account: COption::from(reputation_oracle_token_account.key),
+            reputation_oracle_token_account_account: reputation_oracle_token_account.account,
+            reputation_oracle_stake,
+            recording_oracle: COption::Some(recording_oracle),
+            recording_oracle_token_account: COption::from(recording_oracle_token_account.key),
+            recording_oracle_token_account_account: recording_oracle_token_account.account,
+            recording_oracle_stake,
+            launcher,
+            launcher_account,
+            canceler,
+            canceler_token_account: canceler_token.key,
+            canceler_token_account_account: canceler_token.account,
+            total_amount: 20000000,
+            total_recipients: 1000000,
+            sent_amount: 2000000,
+            sent_recipients: 100000,
+            manifest_url: DataUrl::default(),
+            manifest_hash: DataHash::default(),
+            final_results_url: DataUrl::default(),
+            final_results_hash: DataHash::default(),
+            recipient,
+            recipient_account: recipient_token_account.account,
+        }
+    }
+
+    #[test]
+    fn test_initialize() {
+        let escrow_info = initialize_escrow();
+        // Read account data
+
+        let escrow = Escrow::unpack(&escrow_info.escrow_account.data).unwrap();
+        match escrow.state {
+            EscrowState::Uninitialized => panic!("Escrow is not initialized after init"),
+            EscrowState::Launched => {
+                assert_eq!(escrow.expires, escrow_info.expires);
+                assert_eq!(escrow.bump_seed, escrow_info.bump_seed);
+                assert_eq!(escrow.token_mint, escrow_info.token_mint);
+                assert_eq!(escrow.token_account, escrow_info.token_account);
+                assert_eq!(escrow.launcher, escrow_info.launcher);
+                assert_eq!(escrow.canceler, escrow_info.canceler);
+                assert_eq!(
+                    escrow.canceler_token_account,
+                    escrow_info.canceler_token_account
+                );
+            }
+            _ => panic!("Escrow in a wrong state"),
+        }
+    }
+
+    #[test]
+    fn test_setup() {
+        let escrow_info = initialize_and_setup_escrow();
+        // Read account data
+
+        let escrow = Escrow::unpack(&escrow_info.escrow_account.data).unwrap();
+        match escrow.state {
+            EscrowState::Uninitialized => panic!("Escrow is not initialized after init"),
+            EscrowState::Pending => {
+                assert_eq!(escrow.reputation_oracle, escrow_info.reputation_oracle);
+                assert_eq!(
+                    escrow.reputation_oracle_token_account,
+                    escrow_info.reputation_oracle_token_account
+                );
+                assert_eq!(
+                    escrow.reputation_oracle_stake,
+                    escrow_info.reputation_oracle_stake
+                );
+                assert_eq!(escrow.recording_oracle, escrow_info.recording_oracle);
+                assert_eq!(
+                    escrow.recording_oracle_token_account,
+                    escrow_info.recording_oracle_token_account
+                );
+                assert_eq!(
+                    escrow.recording_oracle_stake,
+                    escrow_info.recording_oracle_stake
+                );
+                assert_eq!(escrow.manifest_url, escrow_info.manifest_url);
+                assert_eq!(escrow.manifest_hash, escrow_info.manifest_hash);
+            }
+            _ => panic!("Escrow in a wrong state"),
+        }
+    }
+
+    #[test]
+    fn test_store_results() {
+        let mut escrow_info = initialize_and_setup_escrow();
+
+        let mut clock = Account::new(0, 100, &sysvar::clock::id());
+
+        let _result = do_process_instruction(
+            store_results(
+                &ESCROW_PROGRAM_ID,
+                &escrow_info.escrow_key,
+                &escrow_info.launcher,
+                100,
+                1,
+                &DataUrl::default(),
+                &DataHash::default(),
+            )
+            .unwrap(),
+            vec![
+                &mut escrow_info.escrow_account,
+                &mut escrow_info.launcher_account,
+                &mut clock, //sysvar
+            ],
+        )
+        .expect("Error on escrow store result");
+
+        let escrow = Escrow::unpack(&escrow_info.escrow_account.data).unwrap();
+
+        match escrow.state {
+            EscrowState::Uninitialized => panic!("Escrow is not initialized after init"),
+            EscrowState::Pending | EscrowState::Partial => {
+                assert_eq!(escrow.total_amount, 100);
+                assert_eq!(escrow.total_recipients, 1);
+                assert_eq!(escrow.final_results_url, DataUrl::default());
+                assert_eq!(escrow.final_results_hash, DataHash::default());
+            }
+            _ => panic!("Escrow in a wrong state"),
+        }
+    }
+
+    #[test]
+    fn test_payout() {
+        let mut escrow_info = initialize_and_setup_escrow();
+
+        let mut clock = Account::new(0, 100, &sysvar::clock::id());
+
+        let _result = do_process_instruction(
+            payout(
+                &ESCROW_PROGRAM_ID,
+                &escrow_info.escrow_key,
+                &escrow_info.launcher,
+                &escrow_info.token_account,
+                &escrow_info.authority,
+                &escrow_info.recipient,
+                &escrow_info.reputation_oracle_token_account.unwrap(),
+                &escrow_info.recording_oracle_token_account.unwrap(),
+                &TOKEN_PROGRAM_ID,
+                10,
+            )
+            .unwrap(),
+            vec![
+                &mut escrow_info.escrow_account,
+                &mut escrow_info.launcher_account,
+                &mut clock, //sysvar
+                &mut escrow_info.token_account_account,
+                &mut escrow_info.authority_account,
+                &mut escrow_info.recipient_account,
+                &mut escrow_info.reputation_oracle_token_account_account,
+                &mut escrow_info.recording_oracle_token_account_account,
+                &mut Account::default(),
+            ],
+        )
+        .expect("Error on escrow store result");
+
+        let escrow = Escrow::unpack(&escrow_info.escrow_account.data).unwrap();
+
+        match escrow.state {
+            EscrowState::Uninitialized => panic!("Escrow is not initialized after init"),
+            EscrowState::Pending | EscrowState::Partial => {
+                assert_eq!(escrow.sent_amount, 10);
+                assert_eq!(escrow.sent_recipients, 1);
+            }
+            _ => panic!("Escrow in a wrong state"),
+        }
+    }
+
+    #[test]
+    fn test_cancel() {
+        let mut escrow_info = initialize_and_setup_escrow();
+
+        let mut clock = Account::new(0, 100, &sysvar::clock::id());
+
+        let _result = do_process_instruction(
+            payout(
+                &ESCROW_PROGRAM_ID,
+                &escrow_info.escrow_key,
+                &escrow_info.launcher,
+                &escrow_info.token_account,
+                &escrow_info.authority,
+                &escrow_info.recipient,
+                &escrow_info.reputation_oracle_token_account.unwrap(),
+                &escrow_info.recording_oracle_token_account.unwrap(),
+                &TOKEN_PROGRAM_ID,
+                10,
+            )
+            .unwrap(),
+            vec![
+                &mut escrow_info.escrow_account,
+                &mut escrow_info.launcher_account,
+                &mut clock, //sysvar
+                &mut escrow_info.token_account_account,
+                &mut escrow_info.authority_account,
+                &mut escrow_info.recipient_account,
+                &mut escrow_info.reputation_oracle_token_account_account,
+                &mut escrow_info.recording_oracle_token_account_account,
+                &mut Account::default(),
+            ],
+        )
+        .expect("Error on escrow payout");
+
+        let _result = do_process_instruction(
+            cancel(
+                &ESCROW_PROGRAM_ID,
+                &escrow_info.escrow_key,
+                &escrow_info.launcher,
+                &escrow_info.token_account,
+                &escrow_info.authority,
+                &escrow_info.canceler_token_account,
+                &TOKEN_PROGRAM_ID,
+            )
+            .unwrap(),
+            vec![
+                &mut escrow_info.escrow_account,
+                &mut escrow_info.launcher_account,
+                &mut escrow_info.token_account_account,
+                &mut escrow_info.authority_account,
+                &mut escrow_info.canceler_token_account_account,
+                &mut Account::default(),
+            ],
+        )
+        .expect("Error on escrow cancel");
+
+        let escrow = Escrow::unpack(&escrow_info.escrow_account.data).unwrap();
+
+        match escrow.state {
+            EscrowState::Uninitialized => panic!("Escrow is not initialized after init"),
+            EscrowState::Cancelled => {}
+            _ => panic!("Escrow in a wrong state"),
+        }
+    }
+
+    #[test]
+    fn test_complete() {
+        let mut escrow_info = initialize_and_setup_escrow();
+
+        let mut clock = Account::new(0, 100, &sysvar::clock::id());
+
+        let _result = do_process_instruction(
+            payout(
+                &ESCROW_PROGRAM_ID,
+                &escrow_info.escrow_key,
+                &escrow_info.launcher,
+                &escrow_info.token_account,
+                &escrow_info.authority,
+                &escrow_info.recipient,
+                &escrow_info.reputation_oracle_token_account.unwrap(),
+                &escrow_info.recording_oracle_token_account.unwrap(),
+                &TOKEN_PROGRAM_ID,
+                100,
+            )
+            .unwrap(),
+            vec![
+                &mut escrow_info.escrow_account,
+                &mut escrow_info.launcher_account,
+                &mut clock, //sysvar
+                &mut escrow_info.token_account_account,
+                &mut escrow_info.authority_account,
+                &mut escrow_info.recipient_account,
+                &mut escrow_info.reputation_oracle_token_account_account,
+                &mut escrow_info.recording_oracle_token_account_account,
+                &mut Account::default(),
+            ],
+        )
+        .expect("Error on escrow payout");
+
+        let _result = do_process_instruction(
+            complete(
+                &ESCROW_PROGRAM_ID,
+                &escrow_info.escrow_key,
+                &escrow_info.launcher,
+            )
+            .unwrap(),
+            vec![
+                &mut escrow_info.escrow_account,
+                &mut escrow_info.launcher_account,
+                &mut clock, //sysvar
+            ],
+        )
+        .expect("Error on escrow complete");
+
+        let escrow = Escrow::unpack(&escrow_info.escrow_account.data).unwrap();
+
+        match escrow.state {
+            EscrowState::Uninitialized => panic!("Escrow is not initialized after init"),
+            EscrowState::Complete => {}
+            _ => panic!("Escrow in a wrong state"),
         }
     }
 }

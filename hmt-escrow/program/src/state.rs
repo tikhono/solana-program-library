@@ -361,7 +361,7 @@ mod test {
             final_results_url: DataUrl::new_from_array([12; URL_LEN]),
             final_results_hash: DataHash::new_from_array([13; 20]),
         };
-        let mut packed_obj: [u8; 4484] = [0; 4484];
+        let mut packed_obj: [u8; 900] = [0; 900];
         Escrow::pack(obj, &mut packed_obj).unwrap();
         let unpacked_obj = Escrow::unpack(&packed_obj).unwrap();
         assert_eq!(unpacked_obj, obj);
